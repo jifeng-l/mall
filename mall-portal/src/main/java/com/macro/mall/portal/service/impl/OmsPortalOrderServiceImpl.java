@@ -671,15 +671,32 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
      *
      * @param orderItemList 可用优惠券的下单商品商品
      */
+//    private void calcPerCouponAmount(List<OmsOrderItem> orderItemList, SmsCoupon coupon) {
+//        BigDecimal totalAmount = calcTotalAmount(orderItemList);
+//        for (OmsOrderItem orderItem : orderItemList) {
+//            //(商品价格/可用商品总价)*优惠券面额
+//            BigDecimal couponAmount = orderItem.getProductPrice().divide(totalAmount, 3, RoundingMode.HALF_EVEN).multiply(coupon.getAmount());
+//            orderItem.setCouponAmount(couponAmount);
+//        }
+//    }
     private void calcPerCouponAmount(List<OmsOrderItem> orderItemList, SmsCoupon coupon) {
         BigDecimal totalAmount = calcTotalAmount(orderItemList);
+        BigDecimal totalCouponAmount = BigDecimal.ZERO; // Total coupon amount
         for (OmsOrderItem orderItem : orderItemList) {
-            //(商品价格/可用商品总价)*优惠券面额
+            //(Product price / Total price of eligible products) * Coupon amount
             BigDecimal couponAmount = orderItem.getProductPrice().divide(totalAmount, 3, RoundingMode.HALF_EVEN).multiply(coupon.getAmount());
             orderItem.setCouponAmount(couponAmount);
+            totalCouponAmount = totalCouponAmount.add(couponAmount); // Accumulate coupon amount
+        }
+
+        // If the distributed amount is less than the coupon amount, add the difference to the first item
+        if (totalCouponAmount.compareTo(coupon.getAmount()) < 0 && !orderItemList.isEmpty()) {
+            BigDecimal remainingAmount = coupon.getAmount().subtract(totalCouponAmount); // Calculate remaining coupon amount
+            OmsOrderItem firstItem = orderItemList.get(0);
+            BigDecimal originalCouponAmount = firstItem.getCouponAmount(); // Original distributed amount
+            firstItem.setCouponAmount(originalCouponAmount.add(remainingAmount)); // Add remaining coupon amount to the first item
         }
     }
-
     /**
      * 获取与优惠券有关系的下单商品
      *
@@ -747,16 +764,53 @@ public class OmsPortalOrderServiceImpl implements OmsPortalOrderService {
     /**
      * 锁定下单商品的所有库存
      */
-    private void lockStock(List<CartPromotionItem> cartPromotionItemList) {
+//    private void lockStock(List<CartPromotionItem> cartPromotionItemList) {
+//        for (CartPromotionItem cartPromotionItem : cartPromotionItemList) {
+//            PmsSkuStock skuStock = skuStockMapper.selectByPrimaryKey(cartPromotionItem.getProductSkuId());
+//            skuStock.setLockStock(skuStock.getLockStock() + cartPromotionItem.getQuantity());
+//            int count = portalOrderDao.lockStockBySkuId(cartPromotionItem.getProductSkuId(),cartPromotionItem.getQuantity());
+//            if(count==0){
+//                Asserts.fail("库存不足，无法下单");
+//            }
+//        }
+//    }
+    public void lockStock(List<CartPromotionItem> cartPromotionItemList) {
         for (CartPromotionItem cartPromotionItem : cartPromotionItemList) {
-            PmsSkuStock skuStock = skuStockMapper.selectByPrimaryKey(cartPromotionItem.getProductSkuId());
-            skuStock.setLockStock(skuStock.getLockStock() + cartPromotionItem.getQuantity());
-            int count = portalOrderDao.lockStockBySkuId(cartPromotionItem.getProductSkuId(),cartPromotionItem.getQuantity());
-            if(count==0){
-                Asserts.fail("库存不足，无法下单");
+            String lockKey = LOCK_KEY_PREFIX + cartPromotionItem.getProductSkuId();
+            String lockValue = UUID.randomUUID().toString();
+            boolean locked = false;
+            try {
+                // Try to acquire the distributed lock
+                locked = tryLock(lockKey, lockValue);
+                if (locked) {
+                    // Lock acquired successfully, execute business logic
+                    PmsSkuStock skuStock = skuStockMapper.selectByPrimaryKey(cartPromotionItem.getProductSkuId());
+                    skuStock.setLockStock(skuStock.getLockStock() + cartPromotionItem.getQuantity());
+                    skuStockMapper.updateByPrimaryKeySelective(skuStock);
+                } else {
+                    // Lock acquisition failed, you can choose to wait for a while or return failure directly
+                    // Here we throw an exception indicating lock acquisition failure
+                    throw new RuntimeException("Failed to acquire lock for productSkuId: " + cartPromotionItem.getProductSkuId());
+                }
+            } finally {
+                // Release the lock
+                if (locked) {
+                    releaseLock(lockKey, lockValue);
+                }
             }
         }
     }
+
+    private boolean tryLock(String lockKey, String lockValue) {
+        return redisTemplate.opsForValue().setIfAbsent(lockKey, lockValue, LOCK_EXPIRE_TIME);
+    }
+
+    private void releaseLock(String lockKey, String lockValue) {
+        String script = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
+        redisTemplate.execute(new DefaultRedisScript<>(script, Long.class),
+                Collections.singletonList(lockKey), lockValue);
+    }
+}
 
     /**
      * 判断下单商品是否都有库存
